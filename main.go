@@ -18,12 +18,12 @@ var (
 )
 
 var rootCmd = &cobra.Command{
-	Use:     "moxdk [host] [iso_name]",
+	Use:     "proxdk [host] [iso_name]",
 	Version: "v0.1.0",
 	Short:   "Manage ISOs in a Proxmox node's local ISO store over SSH",
 	Long: `Interactive when run with no args. gh-style.
-  Upload:  moxdk root@192.168.1.10 --node pve --iso ./debian-12.iso [my-name]
-  Delete:  moxdk root@192.168.1.10 --node pve --iso debian-12.iso -D`,
+  Upload:  proxdk root@192.168.1.10 --node pve --iso ./debian-12.iso [my-name]
+  Delete:  proxdk root@192.168.1.10 --node pve --iso debian-12.iso -D`,
 	Args:         cobra.MaximumNArgs(2),
 	SilenceUsage: true,
 	RunE:         run,

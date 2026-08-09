@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-`moxdk` is a lightweight Go CLI that manages ISOs in a Proxmox node's local ISO store over SSH. Style inspiration: GitHub's `gh` — a flat cobra command, positional arguments, interactive prompts when values are missing. Version `v0.1.0`; scope is the installer-default `local` store only (custom storage paths are out of scope).
+`proxdk` is a lightweight Go CLI that manages ISOs in a Proxmox node's local ISO store over SSH. Style inspiration: GitHub's `gh` — a flat cobra command, positional arguments, interactive prompts when values are missing. Version `v0.1.0`; scope is the installer-default `local` store only (custom storage paths are out of scope).
 
 ## Architecture & Data Flow
 
@@ -34,7 +34,7 @@ None beyond the root — it is a flat repo:
 - `prompt.go` — Bubble Tea interactive prompt helpers
 - `util_test.go` — util.go tests
 - `prompt_test.go` — prompt model tests
-- `moxdk` — compiled binary at root, **gitignored** (`/moxdk` in `.gitignore`)
+- `proxdk` — compiled binary at root, **gitignored** (`/proxdk` in `.gitignore`)
 
 No `scripts/`, `docs/`, `internal/`, or `cmd/` directories.
 
@@ -43,17 +43,17 @@ No `scripts/`, `docs/`, `internal/`, or `cmd/` directories.
 No Makefile, CI, or task runners. Standard Go tooling:
 
 ```sh
-go build ./...        # produces the root ./moxdk binary (gitignored)
+go build ./...        # produces the root ./proxdk binary (gitignored)
 go run .              # run the CLI (fully interactive with no args)
 go test ./...         # run unit tests
 go vet ./...          # static checks
 ```
 
-Module is `moxdk`, Go 1.26.2, no vendoring.
+Module is `proxdk`, Go 1.26.2, no vendoring.
 
 ## Code Conventions & Common Patterns
 
-- **CLI**: one cobra root command `moxdk [host] [iso_name]` (`Args: cobra.MaximumNArgs(2)`, `SilenceUsage`). Flags bound to package vars in `init()`: `--node`, `--iso`, `-D/--delete`, `-F/--force`. No subcommands; do not add any.
+- **CLI**: one cobra root command `proxdk [host] [iso_name]` (`Args: cobra.MaximumNArgs(2)`, `SilenceUsage`). Flags bound to package vars in `init()`: `--node`, `--iso`, `-D/--delete`, `-F/--force`. No subcommands; do not add any.
 - **Interactive prompts**: Bubble Tea (`charmbracelet/bubbletea` + `charmbracelet/bubbles`) — `askText`, `askConfirm`, `askChoice`, `askPassword` in `prompt.go`. Each prompt is a small `tea.Model` (text/confirm/choice) run as its own `tea.Program`; the final frame stays on screen as the terminal transcript. Input comes from a TTY (bubbletea falls back to `/dev/tty` when stdin is piped — prompts never consume piped stdin). `askChoice` uses `bubbles/list` with quit keybindings disabled; Enter picks, Ctrl+C aborts with `Error: interrupted`. Keep prompts isolated in `prompt.go`.
 - **Error handling**: `fmt.Errorf` with `%w` wrapping at each layer; surfaced exactly once in `main` as `Error: <msg>` on stderr, then `os.Exit(1)`. Never print or exit inside helpers.
 - **SSH rule**: ALL SSH ops go through goph/v2 (connect, commands, SFTP, upload, key copy). No `ssh`/`scp`/`ssh-copy-id` subprocesses. `ssh-keygen` is the only SSH-adjacent subprocess (local key generation). Remote shell commands go through `runRemote` only; all SFTP access goes through `remoteFS` (guard.go) — never call `NewSftp` outside `newRemoteFS`.

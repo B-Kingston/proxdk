@@ -1,13 +1,13 @@
-# moxdk
+# proxdk
 
 Manage ISOs in a Proxmox node's local ISO store over SSH. Style inspiration: GitHub's `gh` — flat cobra command, positional arguments, interactive prompts when values are missing.
 
 ## Usage
 
 ```
-Upload:  moxdk [host] [iso_name] --node <node> --iso <local_path> [-F]
-Delete:  moxdk [host] --node <node> --iso <remote_name> -D
-         moxdk                                             (fully interactive)
+Upload:  proxdk [host] [iso_name] --node <node> --iso <local_path> [-F]
+Delete:  proxdk [host] --node <node> --iso <remote_name> -D
+         proxdk                                             (fully interactive)
 ```
 
 - `[host]` is `user@addr`; the user defaults to `root` when omitted. Prompted when missing.
@@ -24,7 +24,7 @@ Delete:  moxdk [host] --node <node> --iso <remote_name> -D
 
 ## Safety
 
-moxdk mutates a Proxmox node's ISO store, which provisions VM boot media — treat it as vital hardware state. The tool is built so no remote command can be sent that is not explicitly allowed:
+proxdk mutates a Proxmox node's ISO store, which provisions VM boot media — treat it as vital hardware state. The tool is built so no remote command can be sent that is not explicitly allowed:
 
 - **Remote command allowlist.** Every remote shell command goes through one gate (`runRemote` in `guard.go`) and must match exactly one of: `ls /etc/pve/nodes`, `echo $HOME`, or the atomic upload finalize `mv -f <store>/<name>.tmp <store>/<name>`. Anything else is refused before any network I/O. Callers pass tokens, never pre-built command strings; the gate quotes each token, so no value can add commands.
 - **Name character set.** Node and ISO names may contain only ASCII letters, digits, and `._@%+=:,-`. Names with `/`, whitespace, quotes, or shell metacharacters are rejected before any connection is made.
@@ -35,7 +35,7 @@ moxdk mutates a Proxmox node's ISO store, which provisions VM boot media — tre
 
 ```mermaid
 flowchart TD
-    A[Start: moxdk args + flags] --> B{Validate flags}
+    A[Start: proxdk args + flags] --> B{Validate flags}
     B -->|--delete with iso_name arg| ERR1[Error: iso_name argument is not used with --delete]
     B -->|--delete with --force| ERR2[Error: --force only applies to uploads]
     B -->|--node given| VNODE{--node name valid?}

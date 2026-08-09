@@ -1,4 +1,4 @@
-module moxdk
+module proxdk
 
 go 1.26.2
 

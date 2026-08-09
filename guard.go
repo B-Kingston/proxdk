@@ -12,7 +12,7 @@ import (
 
 // guard.go is the safety boundary around the Proxmox node. The remote host
 // is controlled by two channels: shell commands and SFTP operations. Every
-// remote shell command moxdk may send is enumerated below, and runRemote is
+// remote shell command proxdk may send is enumerated below, and runRemote is
 // the only function that sends one. A command that is not on the allowlist
 // is refused before any network I/O. SFTP file access goes through
 // storePath, which rejects anything outside the ISO store.
