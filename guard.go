@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/melbahja/goph/v2"
@@ -27,6 +28,16 @@ import (
 //	ls /etc/pve/nodes                      — list cluster nodes (read-only)
 //	echo $HOME                            — resolve the remote home (read-only)
 //	mv -f <store>/<name>.tmp <store>/<name> — finalize an upload (atomic)
+//	pvesh get /cluster/nextid --output-format json  — next free VMID (read-only)
+//	pvesh get /cluster/resources --output-format json — cluster resource usage (read-only)
+//	pvesh get /nodes/<node>/storage --output-format json — storage status of a node (read-only)
+//	qm status <vmid>                      — VM status (read-only)
+//	qm start <vmid>                       — start a VM
+//	qm create <vmid> [validated options]  — create a VM
+//
+// "qm create" is matched structurally: an optional --name pair followed by
+// a fixed, ordered option list (--sockets --cores --memory --scsi0 --ide2
+// --boot --net0 --scsihw), every option value validated independently.
 //
 // Everything else is refused.
 func allowRemoteCommand(argv []string) (string, error) {
@@ -35,10 +46,152 @@ func allowRemoteCommand(argv []string) (string, error) {
 	case len(argv) == 2 && argv[0] == "echo" && argv[1] == "$HOME":
 	case len(argv) == 4 && argv[0] == "mv" && argv[1] == "-f" &&
 		isStorePath(argv[3]) && argv[2] == argv[3]+".tmp":
+	case len(argv) == 5 && argv[0] == "pvesh" && argv[1] == "get" && argv[2] == "/cluster/nextid" && argv[3] == "--output-format" && argv[4] == "json":
+	case len(argv) == 5 && argv[0] == "pvesh" && argv[1] == "get" && argv[2] == "/cluster/resources" && argv[3] == "--output-format" && argv[4] == "json":
+	case len(argv) == 5 && argv[0] == "pvesh" && argv[1] == "get" && isNodeReadPath(argv[2]) && argv[3] == "--output-format" && argv[4] == "json":
+	case len(argv) == 3 && argv[0] == "qm" && (argv[1] == "status" || argv[1] == "start") && validVMIDArg(argv[2]):
+	case len(argv) >= 3 && argv[0] == "qm" && argv[1] == "create" && allowQMCreate(argv) == nil:
 	default:
 		return "", fmt.Errorf("refusing remote command not on the allowlist: %v", argv)
 	}
 	return renderRemoteCommand(argv), nil
+}
+
+// isNodeReadPath accepts the read-only storage listing of a validated
+// node: /nodes/<node>/storage. /nodes/<node>/status is deliberately not
+// allowed — nothing in proxdk reads it.
+func isNodeReadPath(p string) bool {
+	rest, ok := strings.CutPrefix(p, "/nodes/")
+	if !ok {
+		return false
+	}
+	node, ok := strings.CutSuffix(rest, "/storage")
+	if !ok {
+		return false
+	}
+	return validateName(node) == nil
+}
+
+// digitsOnly reports whether s is non-empty ASCII digits.
+func digitsOnly(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// validVMIDArg accepts a qm VMID token: ASCII digits in qm's documented
+// range 100..999999999.
+func validVMIDArg(s string) bool {
+	if len(s) < 3 || len(s) > 9 || !digitsOnly(s) {
+		return false
+	}
+	n, err := strconv.Atoi(s)
+	return err == nil && validVMID(n) == nil
+}
+
+// allowQMCreate validates the option tail of a "qm create" command. The
+// command shape is exactly the one qmCreateArgv emits: an optional --name
+// pair followed by fixed options in a fixed order, each value validated
+// independently here — the gate never trusts the caller's builder.
+func allowQMCreate(argv []string) error {
+	if !validVMIDArg(argv[2]) {
+		return fmt.Errorf("invalid VMID %q", argv[2])
+	}
+	rest := argv[3:]
+	if len(rest) >= 2 && rest[0] == "--name" {
+		if err := validVMName(rest[1]); err != nil {
+			return fmt.Errorf("invalid VM name %q", rest[1])
+		}
+		rest = rest[2:]
+	}
+	tail := []struct {
+		key string
+		val func(string) error
+	}{
+		{"--sockets", exactValue("1")},
+		{"--cores", rangeValue(1, 8192)},
+		{"--memory", rangeValue(16, 4194304)},
+		{"--scsi0", scsi0Value},
+		{"--ide2", ide2Value},
+		{"--boot", exactValue("order=ide2")},
+		{"--net0", exactValue("virtio,bridge=vmbr0")},
+		{"--scsihw", exactValue("virtio-scsi-pci")},
+	}
+	if len(rest) != len(tail)*2 {
+		return fmt.Errorf("unexpected option count")
+	}
+	for i, opt := range tail {
+		if rest[2*i] != opt.key {
+			return fmt.Errorf("unexpected option %q", rest[2*i])
+		}
+		if err := opt.val(rest[2*i+1]); err != nil {
+			return fmt.Errorf("invalid %s value %q", opt.key, rest[2*i+1])
+		}
+	}
+	return nil
+}
+
+// exactValue returns a validator accepting exactly want.
+func exactValue(want string) func(string) error {
+	return func(s string) error {
+		if s != want {
+			return fmt.Errorf("unexpected value %q", s)
+		}
+		return nil
+	}
+}
+
+// rangeValue returns a validator accepting an ASCII digit integer in
+// [lo, hi].
+func rangeValue(lo, hi int64) func(string) error {
+	return func(s string) error {
+		if !digitsOnly(s) {
+			return fmt.Errorf("not an integer")
+		}
+		n, err := strconv.ParseInt(s, 10, 64)
+		if err != nil || n < lo || n > hi {
+			return fmt.Errorf("out of range")
+		}
+		return nil
+	}
+}
+
+// scsi0Value validates a --scsi0 value: <storage>:<size> with a valid
+// storage ID and a size in [1, 4194304] GiB. The size is a plain number —
+// qm's LVM parser rejects a "G" suffix in this position.
+func scsi0Value(s string) error {
+	storage, size, ok := strings.Cut(s, ":")
+	if !ok {
+		return fmt.Errorf("missing ':'")
+	}
+	if err := validStorageID(storage); err != nil {
+		return err
+	}
+	if err := rangeValue(1, 4194304)(size); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ide2Value validates an --ide2 value: local:iso/<name>,media=cdrom with a
+// validated ISO name.
+func ide2Value(s string) error {
+	const prefix = "local:iso/"
+	const suffix = ",media=cdrom"
+	if !strings.HasPrefix(s, prefix) || !strings.HasSuffix(s, suffix) {
+		return fmt.Errorf("bad volume")
+	}
+	name := strings.TrimSuffix(strings.TrimPrefix(s, prefix), suffix)
+	if err := validateName(name); err != nil {
+		return err
+	}
+	return nil
 }
 
 // renderRemoteCommand joins validated argv into one shell command line.

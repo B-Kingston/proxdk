@@ -11,10 +11,15 @@ import (
 )
 
 var (
-	flagNode   string
-	flagISO    string
-	flagDelete bool
-	flagForce  bool
+	flagNode     string
+	flagISO      string
+	flagDelete   bool
+	flagForce    bool
+	flagCreateVM bool
+	flagCores    int
+	flagMemory   int
+	flagDisk     int
+	flagVmid     int
 )
 
 var rootCmd = &cobra.Command{
@@ -41,6 +46,11 @@ func init() {
 	rootCmd.Flags().StringVar(&flagISO, "iso", "", "local ISO path for upload, remote ISO name for delete (interactive if omitted)")
 	rootCmd.Flags().BoolVarP(&flagDelete, "delete", "D", false, "delete the ISO from the node's store instead of uploading")
 	rootCmd.Flags().BoolVarP(&flagForce, "force", "F", false, "overwrite an existing ISO without asking")
+	rootCmd.Flags().BoolVar(&flagCreateVM, "create-vm", false, "after upload (or when the ISO already exists), create and boot a new VM from it")
+	rootCmd.Flags().IntVar(&flagCores, "cores", 0, "vCPU count for the new VM (with --create-vm)")
+	rootCmd.Flags().IntVar(&flagMemory, "memory", 0, "memory for the new VM in MiB (with --create-vm)")
+	rootCmd.Flags().IntVar(&flagDisk, "disk", 0, "disk size for the new VM in GiB (with --create-vm)")
+	rootCmd.Flags().IntVar(&flagVmid, "vmid", 0, "VM ID for the new VM (default: next free)")
 }
 
 func run(cmd *cobra.Command, args []string) error {
@@ -55,15 +65,62 @@ func run(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("invalid --node: %w", err)
 		}
 	}
+	if flagCreateVM && flagDelete {
+		return fmt.Errorf("--create-vm cannot be combined with --delete")
+	}
+	if !flagCreateVM && (flagCores != 0 || flagMemory != 0 || flagDisk != 0 || flagVmid != 0) {
+		return fmt.Errorf("--cores/--memory/--disk/--vmid only apply with --create-vm")
+	}
+	if flagCreateVM {
+		set := 0
+		for _, v := range []int{flagCores, flagMemory, flagDisk} {
+			if v != 0 {
+				set++
+			}
+		}
+		if set != 0 && set != 3 {
+			return fmt.Errorf("--cores, --memory and --disk must be given together")
+		}
+		if set == 3 {
+			if flagCores < 1 || flagCores > 8192 {
+				return fmt.Errorf("invalid --cores %d (use 1-8192)", flagCores)
+			}
+			if flagMemory < 16 || flagMemory > 4194304 {
+				return fmt.Errorf("invalid --memory %d (use 16-4194304 MiB)", flagMemory)
+			}
+			if flagDisk < 1 || flagDisk > 4194304 {
+				return fmt.Errorf("invalid --disk %d (use 1-4194304 GiB)", flagDisk)
+			}
+		}
+		if flagVmid != 0 {
+			if err := validVMID(flagVmid); err != nil {
+				return fmt.Errorf("invalid --vmid: %w", err)
+			}
+		}
+	}
 
 	deleteMode := flagDelete
 	if len(args) == 0 && !flagDelete && !flagForce && flagISO == "" && flagNode == "" {
-		// Fully interactive: pick the action first.
-		idx, err := askChoice("What do you want to do?", []string{"Upload an ISO", "Delete an ISO"}, 0)
+		// Fully interactive: pick the action first. "Create a VM from an
+		// existing ISO" is its own flow; --create-vm is irrelevant here
+		// (it only changes the upload flow, and this branch ignores
+		// upload flags).
+		idx, err := askChoice("What do you want to do?", []string{"Upload an ISO", "Delete an ISO", "Create a VM from an existing ISO"}, 0)
 		if err != nil {
 			return err
 		}
 		deleteMode = idx == 1
+		if idx == 2 {
+			host, err := askText("Proxmox host (user@addr): ")
+			if err != nil {
+				return err
+			}
+			user, addr, err := parseHost(host)
+			if err != nil {
+				return err
+			}
+			return runCreate(user, addr)
+		}
 	}
 
 	if !deleteMode && flagISO != "" {
@@ -209,7 +266,7 @@ func runUpload(user, addr string, args []string) error {
 			}
 			if !overwrite {
 				fmt.Printf("Already present on %s — skipping.\n", node)
-				return nil
+				return runProvision(c, node, name)
 			}
 		}
 	}
@@ -230,7 +287,35 @@ func runUpload(user, addr string, args []string) error {
 		return fmt.Errorf("size mismatch after upload (%d != %d) — rerun to retry", got, fi.Size())
 	}
 	fmt.Printf("OK: %s (%d bytes) on node %s (%s)\n", name, fi.Size(), node, addr)
-	return nil
+	return runProvision(c, node, name)
+}
+
+// runCreate is the interactive "Create a VM from an existing ISO" flow:
+// pick an ISO already in the store, then provision a VM from it.
+func runCreate(user, addr string) error {
+	c, err := connect(user, addr)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+
+	node, err := resolveNode(c, addr)
+	if err != nil {
+		return err
+	}
+
+	files, err := storeFiles(c)
+	if err != nil {
+		return err
+	}
+	if len(files) == 0 {
+		return fmt.Errorf("no ISOs in the store on node %s", node)
+	}
+	idx, err := askChoice("Select ISO", files, 0)
+	if err != nil {
+		return err
+	}
+	return runProvision(c, node, files[idx])
 }
 
 func runDelete(user, addr string) error {

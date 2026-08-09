@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 )
 
@@ -44,6 +45,38 @@ func validateName(s string) error {
 		if !strings.ContainsRune(nameChars, r) {
 			return fmt.Errorf("invalid name %q: character %q is not allowed (use letters, digits, or . _ @ %% + = : , -)", s, r)
 		}
+	}
+	return nil
+}
+
+// pveTokenRe is the character set Proxmox accepts for VM names and storage
+// IDs: a letter or digit first, then letters, digits, ".", "_", "-". This
+// is deliberately stricter than nameChars (which also allows "@%+=:," for
+// ISO filenames).
+var pveTokenRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
+
+// validVMName accepts a Proxmox VM name (the --name option of qm create):
+// pveTokenRe and at most 128 characters.
+func validVMName(s string) error {
+	if !pveTokenRe.MatchString(s) || len(s) > 128 {
+		return fmt.Errorf("invalid VM name %q (use letters, digits, or . _ -)", s)
+	}
+	return nil
+}
+
+// validStorageID accepts a Proxmox storage ID (the --scsi0 option of qm
+// create): pveTokenRe and at most 128 characters.
+func validStorageID(s string) error {
+	if !pveTokenRe.MatchString(s) || len(s) > 128 {
+		return fmt.Errorf("invalid storage ID %q (use letters, digits, or . _ -)", s)
+	}
+	return nil
+}
+
+// validVMID accepts a Proxmox VMID in qm's documented range.
+func validVMID(v int) error {
+	if v < 100 || v > 999999999 {
+		return fmt.Errorf("invalid VM ID %d (use 100-999999999)", v)
 	}
 	return nil
 }

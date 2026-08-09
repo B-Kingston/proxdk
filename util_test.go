@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -190,6 +191,100 @@ func TestAuthorizedKeysHasKey(t *testing.T) {
 	for _, c := range cases {
 		if got := authorizedKeysHasKey(content, c.pub); got != c.want {
 			t.Errorf("authorizedKeysHasKey(%q) = %v, want %v", c.pub, got, c.want)
+		}
+	}
+}
+
+func TestValidVMName(t *testing.T) {
+	cases := []struct {
+		in      string
+		wantErr bool
+	}{
+		{"debian-12", false},
+		{"a", false},
+		{"vm_1", false},
+		{"vm.1", false},
+		{"A1", false},
+		{strings.Repeat("a", 128), false},
+		{"", true},
+		{"-x", true},
+		{".x", true},
+		{"a b", true},
+		{"a@b", true},
+		{"a/b", true},
+		{"a:b", true},
+		{"a+b", true},
+		{"a=b", true},
+		{strings.Repeat("a", 129), true},
+	}
+	for _, c := range cases {
+		err := validVMName(c.in)
+		if c.wantErr {
+			if err == nil {
+				t.Errorf("validVMName(%q): expected error", c.in)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("validVMName(%q): unexpected error: %v", c.in, err)
+		}
+	}
+}
+
+func TestValidStorageID(t *testing.T) {
+	cases := []struct {
+		in      string
+		wantErr bool
+	}{
+		{"local", false},
+		{"local-lvm", false},
+		{"local-zfs", false},
+		{"nfs1", false},
+		{"", true},
+		{"-x", true},
+		{".x", true},
+		{"a:b", true},
+		{"a b", true},
+		{"a/b", true},
+		{"a@b", true},
+	}
+	for _, c := range cases {
+		err := validStorageID(c.in)
+		if c.wantErr {
+			if err == nil {
+				t.Errorf("validStorageID(%q): expected error", c.in)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("validStorageID(%q): unexpected error: %v", c.in, err)
+		}
+	}
+}
+
+func TestValidVMID(t *testing.T) {
+	cases := []struct {
+		in      int
+		wantErr bool
+	}{
+		{100, false},
+		{101, false},
+		{999999999, false},
+		{99, true},
+		{0, true},
+		{1000000000, true},
+		{-1, true},
+	}
+	for _, c := range cases {
+		err := validVMID(c.in)
+		if c.wantErr {
+			if err == nil {
+				t.Errorf("validVMID(%d): expected error", c.in)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("validVMID(%d): unexpected error: %v", c.in, err)
 		}
 	}
 }

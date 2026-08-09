@@ -12,6 +12,7 @@ import (
 
 	"github.com/melbahja/goph/v2"
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/knownhosts"
 )
 
 const connectTimeout = 15 * time.Second
@@ -42,10 +43,29 @@ func ensureKnownHostsFile() error {
 	return f.Close()
 }
 
+// trustState carries the host-trust decision for one connect() call, so a
+// host that was accepted or refused once is not asked about again on the
+// password dial.
+type trustState struct {
+	decided map[string]bool // hostname → trusted
+}
+
+// trustKey normalizes the hostname the SSH library passes to the host key
+// callback ("host:22") to the bare host used elsewhere, so trust decisions
+// keyed in the callback and checked in connect() line up.
+func trustKey(hostname string) string {
+	if h, _, err := net.SplitHostPort(hostname); err == nil {
+		return h
+	}
+	return hostname
+}
+
 // hostKeyCallback implements TOFU: keys already in known_hosts are verified
 // (a mismatch hard-fails as a possible MITM), first-contact keys are
-// fingerprinted and offered to the user before being recorded.
-func hostKeyCallback() (ssh.HostKeyCallback, error) {
+// fingerprinted and offered to the user before being recorded. The
+// decision is remembered in state for the rest of this connect() call, so
+// the password dial does not prompt a second time.
+func hostKeyCallback(state *trustState) (ssh.HostKeyCallback, error) {
 	if err := ensureKnownHostsFile(); err != nil {
 		return nil, err
 	}
@@ -54,23 +74,35 @@ func hostKeyCallback() (ssh.HostKeyCallback, error) {
 		return nil, err
 	}
 	return func(hostname string, remote net.Addr, key ssh.PublicKey) error {
-		found, err := goph.CheckKnownHost(hostname, remote, key, path)
-		if err != nil {
+		_, err := goph.CheckKnownHost(hostname, remote, key, path)
+		if err == nil {
+			return nil // known host with the matching key
+		}
+		// goph reports an unknown host as a *knownhosts.KeyError with no
+		// wanted keys; a real mismatch (or a file problem) carries wanted
+		// keys or is not a KeyError at all. Only the first case is a
+		// first-contact situation.
+		var keyErr *knownhosts.KeyError
+		if !errors.As(err, &keyErr) || len(keyErr.Want) > 0 {
 			return err // known-but-different key: possible MITM, hard fail
 		}
-		if !found {
-			fp := ssh.FingerprintSHA256(key)
-			trust, err := askConfirm(
-				fmt.Sprintf("The authenticity of host %q can't be established.\nSHA256 fingerprint: %s\nTrust this host?", hostname, fp), false)
-			if err != nil {
-				return err
-			}
-			if !trust {
+		if trusted, ok := state.decided[trustKey(hostname)]; ok {
+			if !trusted {
 				return errors.New("host key verification failed")
 			}
-			return goph.AddKnownHost(hostname, remote, key, path)
+			return nil
 		}
-		return nil
+		fp := ssh.FingerprintSHA256(key)
+		trust, err := askConfirm(
+			fmt.Sprintf("The authenticity of host %q can't be established.\nSHA256 fingerprint: %s\nTrust this host?", hostname, fp), false)
+		if err != nil {
+			return err
+		}
+		state.decided[trustKey(hostname)] = trust
+		if !trust {
+			return errors.New("host key verification failed")
+		}
+		return goph.AddKnownHost(hostname, remote, key, path)
 	}, nil
 }
 
@@ -130,9 +162,12 @@ func passwordAuth(user, addr string, cb ssh.HostKeyCallback) (*goph.Client, erro
 
 // connect establishes one SSH connection with the full auth flow:
 // agent+default keys → keygen offer (when no keys exist) → hidden password
-// prompt → optional in-process key copy → reconnect by key.
+// prompt → optional in-process key copy → reconnect by key. Refusing to
+// trust an unknown host aborts here: the password flow never runs against
+// a host the user just declined to verify.
 func connect(user, addr string) (*goph.Client, error) {
-	cb, err := hostKeyCallback()
+	state := &trustState{decided: make(map[string]bool)}
+	cb, err := hostKeyCallback(state)
 	if err != nil {
 		return nil, err
 	}
@@ -163,6 +198,9 @@ func connect(user, addr string) (*goph.Client, error) {
 	}
 	if isNetErr(keyErr) {
 		return nil, fmt.Errorf("cannot connect to %s@%s: %w", user, addr, keyErr)
+	}
+	if trusted, ok := state.decided[trustKey(addr)]; ok && !trusted {
+		return nil, keyErr // user refused to trust the host — do not fall through to password auth
 	}
 
 	client, err := passwordAuth(user, addr, cb)

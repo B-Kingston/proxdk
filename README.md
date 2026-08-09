@@ -7,6 +7,7 @@ Manage ISOs in a Proxmox node's local ISO store over SSH. Style inspiration: Git
 ```
 Upload:  proxdk [host] [iso_name] --node <node> --iso <local_path> [-F]
 Delete:  proxdk [host] --node <node> --iso <remote_name> -D
+Create:  proxdk [host] --node <node> --iso <local_path> --create-vm --cores N --memory N --disk N [--vmid N]
          proxdk                                             (fully interactive)
 ```
 
@@ -17,16 +18,19 @@ Delete:  proxdk [host] --node <node> --iso <remote_name> -D
 - `--iso` is a LOCAL path for upload and a REMOTE name for delete.
 - `-D/--delete` removes an ISO from the node's store; always asks for confirmation.
 - `-F/--force` skips the overwrite confirmation on upload. Rejected together with `-D`.
+- `--create-vm` creates and boots a new VM from the ISO after the upload finishes (or immediately when the ISO is already present, same name — "Already present — skipping." then provision). The VM boots the ISO via `ide2,media=cdrom`; all other VM settings are qm defaults except `--scsihw virtio-scsi-pci`, `--net0 virtio,bridge=vmbr0`, and `--boot order=ide2`. The VM name derives from the ISO name (stripped of `.iso`) when it is a valid PVE name, else the VM is created unnamed.
+- `--cores N --memory N --disk N` size the new VM (vCPUs, MiB RAM, GiB disk) and must be given together; without them `--create-vm` runs the interactive resource picker. `--vmid N` forces a VM ID, default is the cluster's next free ID. These flags only apply with `--create-vm`; `--create-vm` is rejected together with `-D`.
+- Interactive mode offers a third action, "Create a VM from an existing ISO", and the upload flow asks "Create and boot a new VM from this ISO?" when the ISO is in the store.
 - Target store: `/var/lib/vz/template/iso` (the installer-default `local` store).
 - Auth flow: agent + default keys → generate a key if none exists (offered) → hidden password prompt → offer in-process key install → reconnect by key.
 - Upload is atomic: SFTP to `<name>.tmp`, then `mv -f` into place; the size is verified after. A leftover `<name>.tmp` from an interrupted run is only removed after confirmation.
-- Exit codes: 0 on success (including "already present — skipping"), 1 on any error.
+- Exit codes: 0 on success (including "already present — skipping" and declining VM creation), 1 on any error.
 
 ## Safety
 
 proxdk mutates a Proxmox node's ISO store, which provisions VM boot media — treat it as vital hardware state. The tool is built so no remote command can be sent that is not explicitly allowed:
 
-- **Remote command allowlist.** Every remote shell command goes through one gate (`runRemote` in `guard.go`) and must match exactly one of: `ls /etc/pve/nodes`, `echo $HOME`, or the atomic upload finalize `mv -f <store>/<name>.tmp <store>/<name>`. Anything else is refused before any network I/O. Callers pass tokens, never pre-built command strings; the gate quotes each token, so no value can add commands.
+- **Remote command allowlist.** Every remote shell command goes through one gate (`runRemote` in `guard.go`) and must match exactly one of: `ls /etc/pve/nodes`, `echo $HOME`, the atomic upload finalize `mv -f <store>/<name>.tmp <store>/<name>`, the read-only queries `pvesh get /cluster/nextid --output-format json`, `pvesh get /cluster/resources --output-format json`, `pvesh get /nodes/<node>/storage --output-format json`, or `qm status <vmid>` / `qm start <vmid>` / `qm create <vmid>` with a validated VM ID. `qm create` is matched structurally: an optional `--name` pair followed by a fixed, ordered option list (`--sockets --cores --memory --scsi0 --ide2 --boot --net0 --scsihw`), every option value validated independently, so only the exact command proxdk builds can pass. Anything else is refused before any network I/O. Callers pass tokens, never pre-built command strings; the gate quotes each token, so no value can add commands.
 - **Name character set.** Node and ISO names may contain only ASCII letters, digits, and `._@%+=:,-`. Names with `/`, whitespace, quotes, or shell metacharacters are rejected before any connection is made.
 - **Store confinement.** All SFTP access goes through the `remoteFS` wrapper (`guard.go`), which exposes only stat/list/upload/remove inside `/var/lib/vz/template/iso` and the `authorized_keys` append under a validated remote `$HOME`. The raw SFTP client is never exposed, so an operation or path outside these is unrepresentable, not just rejected.
 - **Explicit user authorization.** Upload runs on invocation, overwrite requires `-F` or confirmation, delete always asks, a stale temp is removed only after confirmation, key install and first-contact host trust ask, and Ctrl+C aborts any prompt (`Error: interrupted`).
@@ -41,11 +45,13 @@ flowchart TD
     B -->|--node given| VNODE{--node name valid?}
     VNODE -->|no| ERR3[Error: invalid --node]
     VNODE -->|yes| E{No args, no flags?}
-    E -->|yes| ACTION[Prompt: Upload an ISO / Delete an ISO]
+    E -->|yes| ACTION[Prompt: Upload an ISO / Delete an ISO / Create a VM from an existing ISO]
     E -->|no| ACTION
-    ACTION --> MODE{Delete mode?}
-    MODE -->|yes| PREPD[Prompt remote ISO name if missing; validate; append .iso when missing]
-    MODE -->|no| STAT{--iso local path given?}
+    ACTION --> MODE{Action picked?}
+    MODE -->|create| PREPC[Prompt host if missing; connect; resolve node; list store ISOs; prompt: select ISO]
+    PREPC --> PROVFLOW
+    MODE -->|delete| PREPD[Prompt remote ISO name if missing; validate; append .iso when missing]
+    MODE -->|upload| STAT{--iso local path given?}
     STAT -->|no| PREPU1[Prompt local ISO path]
     STAT -->|yes| PREPU1
     PREPU1 --> PREPU2{Local ISO readable and regular?}
@@ -89,7 +95,9 @@ flowchart TD
         U2 -->|no| U5
         U2 -->|yes, --force| U4[Overwrite without asking]
         U2 -->|yes| U3{Prompt: overwrite?}
-        U3 -->|no| DONE1[Already present - skipping, exit 0]
+        U3 -->|no| C1{--create-vm?}
+        C1 -->|no| DONE1[Already present - skipping, exit 0]
+        C1 -->|yes| PROVFLOW
         U3 -->|yes| U4
         U4 --> U5B{Stale name.tmp on node?}
         U5B -->|yes| U5C{Prompt: remove stale temp?}
@@ -99,7 +107,21 @@ flowchart TD
         U5 --> U6[mv -f into place]
         U6 --> U7{Remote size matches local?}
         U7 -->|no| ERR9[Error: size mismatch after upload]
-        U7 -->|yes| DONE2[OK: uploaded, exit 0]
+        U7 -->|yes| C2{--create-vm?}
+        C2 -->|no| DONE2[OK: uploaded, exit 0]
+        C2 -->|yes| PROVFLOW
+    end
+
+    subgraph PROVFLOW [Create VM]
+        P1{--cores/--memory/--disk all given?}
+        P1 -->|no| P2[Prompt: resource picker on live node + target storage]
+        P1 -->|yes| P4
+        P2 --> P3[VM ID: --vmid or next free; prompted interactively]
+        P3 --> P4[Prompt: proceed? (interactive only)]
+        P4 -->|no| DONE6[Nothing created, exit 0]
+        P4 -->|yes| P5[qm create: name, sockets, cores, memory, scsi0 disk, ide2 ISO, boot order, net0, scsihw]
+        P5 --> P6[qm start]
+        P6 --> DONE5[VM running, exit 0]
     end
 
     subgraph DELFLOW [Delete]
