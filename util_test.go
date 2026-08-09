@@ -9,10 +9,10 @@ import (
 
 func TestParseHost(t *testing.T) {
 	cases := []struct {
-		in       string
-		user     string
-		addr     string
-		wantErr  bool
+		in      string
+		user    string
+		addr    string
+		wantErr bool
 	}{
 		{"root@10.0.0.5", "root", "10.0.0.5", false},
 		{"10.0.0.5", "root", "10.0.0.5", false},
@@ -53,6 +53,8 @@ func TestTargetName(t *testing.T) {
 		{"a/b", "", true},
 		{"..", "", true},
 		{".", "", true},
+		{"a b.iso", "", true},
+		{"a;rm -rf /", "", true},
 	}
 	for _, c := range cases {
 		got, err := targetName(c.in)
@@ -68,6 +70,58 @@ func TestTargetName(t *testing.T) {
 		}
 		if got != c.want {
 			t.Errorf("targetName(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+func TestValidateName(t *testing.T) {
+	cases := []struct {
+		in      string
+		wantErr bool
+	}{
+		{"debian-12.1.0.iso", false},
+		{"ubuntu_24.04-live-server-amd64.iso", false},
+		{"FOO.ISO", false},
+		{"a@b:1,2%3+4=5.iso", false},
+		{"-x.iso", false},
+		{".hidden.iso", false},
+		{"", true},
+		{".", true},
+		{"..", true},
+		{"a/b", true},
+		{"a b", true},
+		{"a\tb", true},
+		{"a\nb", true},
+		{"a;rm -rf /", true},
+		{"a$(id).iso", true},
+		{"a`id`.iso", true},
+		{"a&b", true},
+		{"a|b", true},
+		{"a'b", true},
+		{`a"b`, true},
+		{"a$b", true},
+		{`a\b`, true},
+		{"a*b", true},
+		{"a?b", true},
+		{"~x", true},
+		{"x!y", true},
+		{"x{y}", true},
+		{"x[y]", true},
+		{"x<y>z", true},
+		{"x#y", true},
+		{"x^y", true},
+		{"x\u00e9.iso", true}, // non-ASCII
+	}
+	for _, c := range cases {
+		err := validateName(c.in)
+		if c.wantErr {
+			if err == nil {
+				t.Errorf("validateName(%q): expected error", c.in)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("validateName(%q): unexpected error: %v", c.in, err)
 		}
 	}
 }
@@ -109,6 +163,7 @@ func TestFindDefaultKeys(t *testing.T) {
 func TestShellQuote(t *testing.T) {
 	cases := []struct{ in, want string }{
 		{"plain", "plain"},
+		{"/etc/pve/nodes", "/etc/pve/nodes"},
 		{"a b", "'a b'"},
 		{"a'b", `'a'\''b'`},
 		{"", "''"},

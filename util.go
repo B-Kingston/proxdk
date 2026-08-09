@@ -25,12 +25,25 @@ func parseHost(raw string) (user, addr string, err error) {
 	return user, addr, nil
 }
 
-// validateName rejects names that are empty, ".", "..", or contain "/".
-// It is the single gate that keeps node names and ISO names from escaping
-// their directories on the remote side.
+// nameChars is the only character set allowed in node and ISO names:
+// ASCII letters and digits plus a small punctuation set that is safe in
+// shell arguments, SFTP paths, and the filesystem. Everything else —
+// whitespace, "/", quotes, and all shell metacharacters — is rejected so a
+// name can never alter a remote command or escape the ISO store.
+const nameChars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._@%+=:,-"
+
+// validateName rejects names that are empty, ".", "..", or contain any
+// character outside nameChars. It is the single gate that keeps node names
+// and ISO names from escaping their directories or the shell allowlist on
+// the remote side.
 func validateName(s string) error {
-	if s == "" || s == "." || s == ".." || strings.Contains(s, "/") {
+	if s == "" || s == "." || s == ".." {
 		return fmt.Errorf("invalid name %q", s)
+	}
+	for _, r := range s {
+		if !strings.ContainsRune(nameChars, r) {
+			return fmt.Errorf("invalid name %q: character %q is not allowed (use letters, digits, or . _ @ %% + = : , -)", s, r)
+		}
 	}
 	return nil
 }
@@ -71,7 +84,7 @@ func shellQuote(s string) string {
 		for _, r := range s {
 			switch {
 			case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
-			case strings.ContainsRune("_@.:%+=,-", r):
+			case strings.ContainsRune("_@.:%+=,-/", r):
 			default:
 				safe = false
 			}

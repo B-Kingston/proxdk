@@ -19,8 +19,17 @@ Delete:  moxdk [host] --node <node> --iso <remote_name> -D
 - `-F/--force` skips the overwrite confirmation on upload. Rejected together with `-D`.
 - Target store: `/var/lib/vz/template/iso` (the installer-default `local` store).
 - Auth flow: agent + default keys → generate a key if none exists (offered) → hidden password prompt → offer in-process key install → reconnect by key.
-- Upload is atomic: SFTP to `<name>.tmp`, then `mv -f` into place; the size is verified after.
+- Upload is atomic: SFTP to `<name>.tmp`, then `mv -f` into place; the size is verified after. A leftover `<name>.tmp` from an interrupted run is only removed after confirmation.
 - Exit codes: 0 on success (including "already present — skipping"), 1 on any error.
+
+## Safety
+
+moxdk mutates a Proxmox node's ISO store, which provisions VM boot media — treat it as vital hardware state. The tool is built so no remote command can be sent that is not explicitly allowed:
+
+- **Remote command allowlist.** Every remote shell command goes through one gate (`runRemote` in `guard.go`) and must match exactly one of: `ls /etc/pve/nodes`, `echo $HOME`, or the atomic upload finalize `mv -f <store>/<name>.tmp <store>/<name>`. Anything else is refused before any network I/O. Callers pass tokens, never pre-built command strings; the gate quotes each token, so no value can add commands.
+- **Name character set.** Node and ISO names may contain only ASCII letters, digits, and `._@%+=:,-`. Names with `/`, whitespace, quotes, or shell metacharacters are rejected before any connection is made.
+- **Store confinement.** All SFTP access goes through the `remoteFS` wrapper (`guard.go`), which exposes only stat/list/upload/remove inside `/var/lib/vz/template/iso` and the `authorized_keys` append under a validated remote `$HOME`. The raw SFTP client is never exposed, so an operation or path outside these is unrepresentable, not just rejected.
+- **Explicit user authorization.** Upload runs on invocation, overwrite requires `-F` or confirmation, delete always asks, a stale temp is removed only after confirmation, key install and first-contact host trust ask, and Ctrl+C aborts any prompt (`Error: interrupted`).
 
 ## CLI flow
 
@@ -82,7 +91,11 @@ flowchart TD
         U2 -->|yes| U3{Prompt: overwrite?}
         U3 -->|no| DONE1[Already present - skipping, exit 0]
         U3 -->|yes| U4
-        U4 --> U5[SFTP to name.tmp]
+        U4 --> U5B{Stale name.tmp on node?}
+        U5B -->|yes| U5C{Prompt: remove stale temp?}
+        U5C -->|no| ERR12[Error: upload aborted]
+        U5C -->|yes| U5[SFTP to name.tmp]
+        U5B -->|no| U5
         U5 --> U6[mv -f into place]
         U6 --> U7{Remote size matches local?}
         U7 -->|no| ERR9[Error: size mismatch after upload]
@@ -115,4 +128,5 @@ flowchart TD
     ERR9 --> X
     ERR10 --> X
     ERR11 --> X
+    ERR12 --> X
 ```

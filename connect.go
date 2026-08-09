@@ -3,7 +3,6 @@ package main
 import (
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -195,7 +194,9 @@ func connect(user, addr string) (*goph.Client, error) {
 }
 
 // installPubKey is an in-process ssh-copy-id: it appends the local public
-// key to ~/.ssh/authorized_keys on the remote via SFTP (idempotent).
+// key to ~/.ssh/authorized_keys on the remote via SFTP (idempotent). The
+// remote home comes from the allowlisted "echo $HOME" command and is
+// validated before any key-install path is derived.
 func installPubKey(c *goph.Client, pubKeyPath string) error {
 	pub, err := os.ReadFile(pubKeyPath)
 	if err != nil {
@@ -206,59 +207,19 @@ func installPubKey(c *goph.Client, pubKeyPath string) error {
 		return fmt.Errorf("public key file %s is empty", pubKeyPath)
 	}
 
-	out, err := c.Run("echo $HOME")
+	out, err := runRemote(c, "echo", "$HOME")
 	if err != nil {
 		return fmt.Errorf("cannot resolve remote home: %w", err)
 	}
 	home := strings.TrimSpace(string(out))
-	if home == "" {
-		return errors.New("remote $HOME is empty")
+	if err := validRemoteHome(home); err != nil {
+		return err
 	}
 
-	sc, err := c.NewSftp()
+	fs, err := newRemoteFS(c)
 	if err != nil {
-		return fmt.Errorf("cannot open SFTP session: %w", err)
+		return err
 	}
-	defer sc.Close()
-
-	sshDir := home + "/.ssh"
-	if err := sc.MkdirAll(sshDir); err != nil {
-		return fmt.Errorf("cannot create %s: %w", sshDir, err)
-	}
-	if err := sc.Chmod(sshDir, 0o700); err != nil {
-		return fmt.Errorf("cannot chmod %s: %w", sshDir, err)
-	}
-
-	authFile := sshDir + "/authorized_keys"
-	content := ""
-	if f, err := sc.Open(authFile); err == nil {
-		b, rerr := io.ReadAll(f)
-		f.Close()
-		if rerr != nil {
-			return fmt.Errorf("cannot read %s: %w", authFile, rerr)
-		}
-		content = string(b)
-		if authorizedKeysHasKey(content, pubLine) {
-			return nil // already installed
-		}
-	} else if !os.IsNotExist(err) {
-		return fmt.Errorf("cannot read %s: %w", authFile, err)
-	}
-
-	f, err := sc.OpenFile(authFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND)
-	if err != nil {
-		return fmt.Errorf("cannot open %s for append: %w", authFile, err)
-	}
-	defer f.Close()
-	sep := ""
-	if content != "" && !strings.HasSuffix(content, "\n") {
-		sep = "\n"
-	}
-	if _, err := f.Write([]byte(sep + pubLine + "\n")); err != nil {
-		return fmt.Errorf("cannot append key to %s: %w", authFile, err)
-	}
-	if err := f.Chmod(0o600); err != nil {
-		return fmt.Errorf("cannot chmod %s: %w", authFile, err)
-	}
-	return nil
+	defer fs.Close()
+	return fs.appendAuthorizedKey(home, pubLine)
 }

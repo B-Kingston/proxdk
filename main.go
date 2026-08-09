@@ -189,8 +189,13 @@ func runUpload(user, addr string, args []string) error {
 		return fmt.Errorf("%s not found on %s — is this a Proxmox host? (custom local storage paths are not supported in v0.1)", isoStoreDir, addr)
 	}
 
-	target := isoStoreDir + "/" + name
-	r, exists, err := remoteSize(c, target)
+	fs, err := newRemoteFS(c)
+	if err != nil {
+		return err
+	}
+	defer fs.Close()
+
+	r, exists, err := fs.storeFileSize(name)
 	if err != nil {
 		return err
 	}
@@ -210,16 +215,16 @@ func runUpload(user, addr string, args []string) error {
 	}
 
 	fmt.Printf("Uploading %s (%d bytes)…\n", name, fi.Size())
-	if err := uploadISO(c, isoPath, target); err != nil {
+	if err := uploadISO(c, isoPath, name); err != nil {
 		return err
 	}
 
-	got, exists, err := remoteSize(c, target)
+	got, exists, err := fs.storeFileSize(name)
 	if err != nil {
 		return err
 	}
 	if !exists {
-		return fmt.Errorf("upload verify failed: %s missing after upload", target)
+		return fmt.Errorf("upload verify failed: %s missing after upload", name)
 	}
 	if got != fi.Size() {
 		return fmt.Errorf("size mismatch after upload (%d != %d) — rerun to retry", got, fi.Size())
@@ -253,8 +258,13 @@ func runDelete(user, addr string) error {
 		return err
 	}
 
-	target := isoStoreDir + "/" + name
-	_, exists, err := remoteSize(c, target)
+	fs, err := newRemoteFS(c)
+	if err != nil {
+		return err
+	}
+	defer fs.Close()
+
+	_, exists, err := fs.storeFileSize(name)
 	if err != nil {
 		return err
 	}
@@ -274,15 +284,15 @@ func runDelete(user, addr string) error {
 		return nil
 	}
 
-	if err := removeRemote(c, target); err != nil {
+	if err := fs.removeStoreFile(name); err != nil {
 		return err
 	}
-	_, exists, err = remoteSize(c, target)
+	_, exists, err = fs.storeFileSize(name)
 	if err != nil {
 		return err
 	}
 	if exists {
-		return fmt.Errorf("delete verify failed: %s still present", target)
+		return fmt.Errorf("delete verify failed: %s still present", name)
 	}
 	fmt.Printf("Deleted %s from node %s (%s)\n", name, node, addr)
 	return nil
