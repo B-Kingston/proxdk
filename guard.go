@@ -33,6 +33,7 @@ import (
 //	pvesh get /nodes/<node>/storage --output-format json — storage status of a node (read-only)
 //	qm status <vmid>                      — VM status (read-only)
 //	qm start <vmid>                       — start a VM
+//	qm destroy <vmid>                     — destroy a VM
 //	qm create <vmid> [validated options]  — create a VM
 //
 // "qm create" is matched structurally: an optional --name pair followed by
@@ -50,6 +51,7 @@ func allowRemoteCommand(argv []string) (string, error) {
 	case len(argv) == 5 && argv[0] == "pvesh" && argv[1] == "get" && argv[2] == "/cluster/resources" && argv[3] == "--output-format" && argv[4] == "json":
 	case len(argv) == 5 && argv[0] == "pvesh" && argv[1] == "get" && isNodeReadPath(argv[2]) && argv[3] == "--output-format" && argv[4] == "json":
 	case len(argv) == 3 && argv[0] == "qm" && (argv[1] == "status" || argv[1] == "start") && validVMIDArg(argv[2]):
+	case len(argv) == 3 && argv[0] == "qm" && argv[1] == "destroy" && validVMIDArg(argv[2]):
 	case len(argv) >= 3 && argv[0] == "qm" && argv[1] == "create" && allowQMCreate(argv) == nil:
 	default:
 		return "", fmt.Errorf("refusing remote command not on the allowlist: %v", argv)
@@ -179,15 +181,22 @@ func scsi0Value(s string) error {
 	return nil
 }
 
-// ide2Value validates an --ide2 value: local:iso/<name>,media=cdrom with a
-// validated ISO name.
+// ide2Value validates an --ide2 value: <storage>:iso/<name>,media=cdrom
+// with a valid storage ID and a validated ISO name. The storage is any
+// storage that can hold ISOs (default installs: local), because the ISO
+// store is configurable per host.
 func ide2Value(s string) error {
-	const prefix = "local:iso/"
-	const suffix = ",media=cdrom"
-	if !strings.HasPrefix(s, prefix) || !strings.HasSuffix(s, suffix) {
+	body, ok := strings.CutSuffix(s, ",media=cdrom")
+	if !ok {
 		return fmt.Errorf("bad volume")
 	}
-	name := strings.TrimSuffix(strings.TrimPrefix(s, prefix), suffix)
+	storage, name, ok := strings.Cut(body, ":iso/")
+	if !ok {
+		return fmt.Errorf("bad volume")
+	}
+	if err := validStorageID(storage); err != nil {
+		return err
+	}
 	if err := validateName(name); err != nil {
 		return err
 	}
@@ -222,6 +231,12 @@ func runRemote(c *goph.Client, argv ...string) ([]byte, error) {
 	}
 	out, err := c.Run(cmd)
 	if err != nil {
+		// goph's Run returns CombinedOutput, so a failed command's
+		// stderr is in out — keep it so the user sees qm's actual
+		// error, not just the exit status.
+		if msg := strings.TrimSpace(string(out)); msg != "" {
+			return nil, fmt.Errorf("remote command %q failed: %s (%w)", cmd, msg, err)
+		}
 		return nil, fmt.Errorf("remote command %q failed: %w", cmd, err)
 	}
 	return out, nil
@@ -318,6 +333,14 @@ func (f *remoteFS) storeFiles() ([]string, error) {
 		}
 	}
 	return names, nil
+}
+
+// storeFileStat stats a file in the ISO store.
+func (f *remoteFS) storeFileStat(name string) (os.FileInfo, error) {
+	if err := validateName(name); err != nil {
+		return nil, err
+	}
+	return f.c.Stat(isoStoreDir + "/" + name)
 }
 
 // storeFileSize returns the size and existence of a file in the ISO store.

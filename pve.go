@@ -5,13 +5,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/melbahja/goph/v2"
 )
-
-// isoStoreDir is the physical directory of the installer-default "local"
-// storage on a Proxmox node.
-const isoStoreDir = "/var/lib/vz/template/iso"
 
 // listNodes returns the cluster node names on the host (one directory per
 // node under /etc/pve/nodes).
@@ -103,6 +100,52 @@ func uploadISO(c *goph.Client, local, name string) error {
 		return fmt.Errorf("finalize failed: %w", err)
 	}
 	return nil
+}
+
+// storeEntry is one file in the ISO store.
+type storeEntry struct {
+	Name    string
+	Size    int64
+	ModTime time.Time
+}
+
+// listStoreEntries returns the store files with their sizes and mtimes.
+// A file deleted between listing and stat is skipped.
+func listStoreEntries(c *goph.Client) ([]storeEntry, error) {
+	fs, err := newRemoteFS(c)
+	if err != nil {
+		return nil, err
+	}
+	defer fs.Close()
+	names, err := fs.storeFiles()
+	if err != nil {
+		return nil, err
+	}
+	entries := make([]storeEntry, 0, len(names))
+	for _, n := range names {
+		fi, err := fs.storeFileStat(n)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return nil, fmt.Errorf("cannot stat %s: %w", n, err)
+		}
+		entries = append(entries, storeEntry{Name: n, Size: fi.Size(), ModTime: fi.ModTime()})
+	}
+	return entries, nil
+}
+
+// isoStorageInfo finds the storage holding the ISO store on node and
+// returns its ID, physical path, and capacity usage in bytes. The match is
+// by path (PVE dir storages keep ISOs in <path>/template/iso); when no
+// storage's path matches the configured store, the first enabled, active
+// storage with iso content is used.
+func isoStorageInfo(c *goph.Client, node string) (storage, path string, totalB, usedB int64, err error) {
+	out, err := runRemote(c, "pvesh", "get", "/nodes/"+node+"/storage", "--output-format", "json")
+	if err != nil {
+		return "", "", 0, 0, fmt.Errorf("cannot load storage list: %w", err)
+	}
+	return parseIsoStorage(out, isoStoreDir)
 }
 
 // joinList formats a string slice for error messages.

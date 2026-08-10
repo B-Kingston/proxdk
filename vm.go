@@ -16,6 +16,7 @@ type clusterResource struct {
 	Type    string  `json:"type"`
 	Node    string  `json:"node"`
 	VMID    int     `json:"vmid"`
+	Name    string  `json:"name"`
 	MaxCPU  float64 `json:"maxcpu"`
 	MaxMem  int64   `json:"maxmem"`
 	Mem     int64   `json:"mem"`
@@ -128,6 +129,7 @@ type storageEntry struct {
 	Content string `json:"content"`
 	Enabled int    `json:"enabled"`
 	Active  int    `json:"active"`
+	Path    string `json:"path"`
 	Total   int64  `json:"total"`
 	Used    int64  `json:"used"`
 }
@@ -172,6 +174,55 @@ func pickVMStorage(c *goph.Client, node string) (storage string, totalGiB, usedG
 	return parseStorageList(out)
 }
 
+// parseIsoStorage finds the storage holding the ISO store from "pvesh get
+// /nodes/<node>/storage" output and returns its ID, path, and capacity
+// usage in bytes. PVE dir storages keep ISOs in <path>/template/iso, so
+// the store dir is matched against <path>/template/iso; when nothing
+// matches, the first enabled, active storage with iso content is used.
+func parseIsoStorage(data []byte, storeDir string) (storage, path string, totalB, usedB int64, err error) {
+	var entries []storageEntry
+	if err := json.Unmarshal(data, &entries); err != nil {
+		return "", "", 0, 0, fmt.Errorf("cannot parse storage list: %w", err)
+	}
+	var seen []string
+	var fallback *storageEntry
+	for i := range entries {
+		e := &entries[i]
+		if e.Storage != "" {
+			seen = append(seen, e.Storage)
+		}
+		if e.Enabled != 1 || e.Active != 1 || e.Total <= 0 {
+			continue
+		}
+		if !hasContent(e.Content, "iso") {
+			continue
+		}
+		if e.Path != "" && strings.TrimSuffix(e.Path, "/")+"/template/iso" == storeDir {
+			return e.Storage, e.Path, e.Total, e.Used, nil
+		}
+		if fallback == nil {
+			fallback = e
+		}
+	}
+	if fallback != nil {
+		return fallback.Storage, fallback.Path, fallback.Total, fallback.Used, nil
+	}
+	if len(seen) == 0 {
+		return "", "", 0, 0, fmt.Errorf("no storage with iso content is active on this node")
+	}
+	return "", "", 0, 0, fmt.Errorf("no storage with iso content is active on this node (seen: %s)", joinList(seen))
+}
+
+// hasContent reports whether a storage content list includes want.
+func hasContent(content, want string) bool {
+	for _, c := range strings.Split(content, ",") {
+		if c == want {
+			return true
+		}
+	}
+	return false
+}
+
 // vmNameFromISO derives a Proxmox VM name from an ISO name: the ISO name
 // without its .iso/.ISO suffix, valid per validVMName. ok=false when the
 // result would violate PVE's name rules (the VM is then created without a
@@ -190,8 +241,10 @@ func vmNameFromISO(isoName string) (name string, ok bool) {
 // qmCreateArgv builds the argv of the allowlisted "qm create" command for
 // a new VM: an optional --name pair, then the fixed options in the exact
 // order allowQMCreate expects. Every value is validated locally, so the
-// command is guaranteed to pass the remote gate.
-func qmCreateArgv(vmid int, sel resourceSelection, storage, isoName string) ([]string, error) {
+// command is guaranteed to pass the remote gate. diskStorage holds the VM
+// disk, isoStorage holds the boot ISO (the storage the ISO store lives
+// on); both are validated storage IDs.
+func qmCreateArgv(vmid int, sel resourceSelection, diskStorage, isoStorage, isoName string) ([]string, error) {
 	if err := validVMID(vmid); err != nil {
 		return nil, err
 	}
@@ -204,7 +257,10 @@ func qmCreateArgv(vmid int, sel resourceSelection, storage, isoName string) ([]s
 	if sel.diskGiB < 1 || sel.diskGiB > 4194304 {
 		return nil, fmt.Errorf("invalid disk size %dG (use 1-4194304)", sel.diskGiB)
 	}
-	if err := validStorageID(storage); err != nil {
+	if err := validStorageID(diskStorage); err != nil {
+		return nil, err
+	}
+	if err := validStorageID(isoStorage); err != nil {
 		return nil, err
 	}
 	if err := validateName(isoName); err != nil {
@@ -218,8 +274,8 @@ func qmCreateArgv(vmid int, sel resourceSelection, storage, isoName string) ([]s
 		"--sockets", "1",
 		"--cores", strconv.FormatInt(sel.cores, 10),
 		"--memory", strconv.FormatInt(sel.memoryMiB, 10),
-		"--scsi0", storage+":"+strconv.FormatInt(sel.diskGiB, 10),
-		"--ide2", "local:iso/"+isoName+",media=cdrom",
+		"--scsi0", diskStorage+":"+strconv.FormatInt(sel.diskGiB, 10),
+		"--ide2", isoStorage+":iso/"+isoName+",media=cdrom",
 		"--boot", "order=ide2",
 		"--net0", "virtio,bridge=vmbr0",
 		"--scsihw", "virtio-scsi-pci",
@@ -294,16 +350,17 @@ func startVM(c *goph.Client, vmid int) error {
 // runProvision creates and boots a new VM from an ISO that is present in
 // the node's store, sized by the resource selection (live picker in
 // interactive mode, --cores/--memory/--disk flags otherwise), and prints
-// progress. Declining a prompt exits 0, like "already present — skipping".
-func runProvision(c *goph.Client, node, isoName string) error {
+// progress. Declining a prompt exits 0, like "already present — skipping":
+// the returned vmid is 0 then, and the created VM's ID otherwise.
+func runProvision(c *goph.Client, node, isoName string) (int, error) {
 	interactive := flagCores == 0 // run() enforces all-or-none of the resource flags
 	if interactive {
 		ok, err := askConfirm("Create and boot a new VM from this ISO?", true)
 		if err != nil {
-			return err
+			return 0, err
 		}
 		if !ok {
-			return nil
+			return 0, nil
 		}
 	}
 
@@ -316,19 +373,19 @@ func runProvision(c *goph.Client, node, isoName string) error {
 	if interactive {
 		snap, err := buildSnapshot(c, node)
 		if err != nil {
-			return err
+			return 0, err
 		}
 		storage, totalGiB, usedGiB, err = pickVMStorage(c, node)
 		if err != nil {
-			return err
+			return 0, err
 		}
 		snap.diskTotalGiB, snap.diskUsedGiB = totalGiB, usedGiB
 		sel, err = runResourcePicker(snap)
 		if err != nil {
-			return err
+			return 0, err
 		}
 		if err := validateSelection(sel); err != nil {
-			return err
+			return 0, err
 		}
 	} else {
 		sel = resourceSelection{cores: int64(flagCores), memoryMiB: int64(flagMemory), diskGiB: int64(flagDisk)}
@@ -338,18 +395,18 @@ func runProvision(c *goph.Client, node, isoName string) error {
 	if vmid == 0 {
 		vmid, err = nextVMID(c)
 		if err != nil {
-			return err
+			return 0, err
 		}
 	}
 	if interactive {
 		answer, err := askText(fmt.Sprintf("VM ID (default %d): ", vmid))
 		if err != nil {
-			return err
+			return 0, err
 		}
 		if answer != "" {
 			n, perr := strconv.Atoi(answer)
 			if perr != nil || validVMID(n) != nil {
-				return fmt.Errorf("invalid VM ID %q (use 100-999999999)", answer)
+				return 0, fmt.Errorf("invalid VM ID %q (use 100-999999999)", answer)
 			}
 			vmid = n
 		}
@@ -358,39 +415,146 @@ func runProvision(c *goph.Client, node, isoName string) error {
 	if !interactive {
 		storage, totalGiB, usedGiB, err = pickVMStorage(c, node)
 		if err != nil {
-			return err
+			return 0, err
 		}
 	}
 	if sel.diskGiB > totalGiB-usedGiB {
-		return fmt.Errorf("disk %dG exceeds free space on %s (%dG available)", sel.diskGiB, storage, totalGiB-usedGiB)
+		return 0, fmt.Errorf("disk %dG exceeds free space on %s (%dG available)", sel.diskGiB, storage, totalGiB-usedGiB)
 	}
 
-	argv, err := qmCreateArgv(vmid, sel, storage, isoName)
+	// The ISO store may live on a non-default storage; resolve its ID so
+	// the cdrom volume references the right one.
+	isoStorage, _, _, _, err := isoStorageInfo(c, node)
 	if err != nil {
-		return err
+		return 0, err
+	}
+
+	argv, err := qmCreateArgv(vmid, sel, storage, isoStorage, isoName)
+	if err != nil {
+		return 0, err
 	}
 	name, _ := vmNameFromISO(isoName)
 	if name == "" {
 		name = "unlabeled"
 	}
-	fmt.Printf("Creating VM %d (%s): %d vcores · %d MiB RAM · %dG disk on %s, booting local:iso/%s\n",
-		vmid, name, sel.cores, sel.memoryMiB, sel.diskGiB, storage, isoName)
+	fmt.Printf("Creating VM %d (%s): %d vcores · %d MiB RAM · %dG disk on %s, booting %s:iso/%s\n",
+		vmid, name, sel.cores, sel.memoryMiB, sel.diskGiB, storage, isoStorage, isoName)
 	if interactive {
 		ok, err := askConfirm("Proceed?", true)
 		if err != nil {
-			return err
+			return 0, err
 		}
 		if !ok {
-			return nil
+			return 0, nil
 		}
 	}
 
 	if err := createVM(c, argv, vmid); err != nil {
-		return err
+		return 0, err
 	}
 	if err := startVM(c, vmid); err != nil {
-		return fmt.Errorf("VM %d created but failed to start: %w", vmid, err)
+		return 0, fmt.Errorf("VM %d created but failed to start: %w", vmid, err)
 	}
 	fmt.Printf("VM %d (%s) is running on node %s\n", vmid, name, node)
+	return vmid, nil
+}
+
+// parseVMList extracts the QEMU VM entries of "pvesh get
+// /cluster/resources" output.
+func parseVMList(data []byte) ([]clusterResource, error) {
+	var entries []clusterResource
+	if err := json.Unmarshal(data, &entries); err != nil {
+		return nil, fmt.Errorf("cannot parse cluster resources: %w", err)
+	}
+	var vms []clusterResource
+	for _, e := range entries {
+		if e.Type == "qemu" {
+			vms = append(vms, e)
+		}
+	}
+	return vms, nil
+}
+
+// vmInfo returns the name of the VM with the given ID on node, or an
+// error when the VM is missing or lives on another node. The empty name is
+// a valid result (VMs can be unnamed).
+func vmInfo(c *goph.Client, node string, vmid int) (string, error) {
+	out, err := runRemote(c, "pvesh", "get", "/cluster/resources", "--output-format", "json")
+	if err != nil {
+		return "", fmt.Errorf("cannot load cluster resources: %w", err)
+	}
+	vms, err := parseVMList(out)
+	if err != nil {
+		return "", err
+	}
+	for _, e := range vms {
+		if e.VMID == vmid {
+			if e.Node != node {
+				return "", fmt.Errorf("VM %d is on node %s, not %s", vmid, e.Node, node)
+			}
+			return e.Name, nil
+		}
+	}
+	return "", fmt.Errorf("VM %d not found on node %s", vmid, node)
+}
+
+// vmGone reports whether qm status no longer knows the VM — the
+// verification that a destroy took effect. qm reports a destroyed VM as
+// "not found" on stderr; the combined output lands in the error string.
+func vmGone(err error) bool {
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "not found") || strings.Contains(msg, "does not exist")
+}
+
+// runDeleteVM destroys a VM after confirmation and verifies it is gone.
+// Declining exits 0. Destruction is confined to VMs proxdk created (the
+// VM ledger); anything else is refused before connecting.
+func runDeleteVM(user, addr string, vmid int) error {
+	if err := applyProfile(user, addr); err != nil {
+		return err
+	}
+	if !isDeletableVM(user, addr, vmid) {
+		return fmt.Errorf("refusing to delete VM %d: it is not tracked as a VM proxdk created on %s. Destroy it through the Proxmox UI, or edit the vms list in the config file", vmid, hostKey(user, addr))
+	}
+	key := profileFor(user, addr).Key
+	c, err := connect(user, addr, []string{key})
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+
+	node, err := resolveNode(c, addr)
+	if err != nil {
+		return err
+	}
+
+	name, err := vmInfo(c, node, vmid)
+	if err != nil {
+		return err
+	}
+	display := name
+	if display == "" {
+		display = "unlabeled"
+	}
+
+	ok, err := askConfirm(fmt.Sprintf("Delete VM %d (%s) from node %q? This cannot be undone.", vmid, display, node), false)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return nil
+	}
+
+	if _, err := runRemote(c, "qm", "destroy", strconv.Itoa(vmid)); err != nil {
+		return err
+	}
+	if _, err := runRemote(c, "qm", "status", strconv.Itoa(vmid)); err == nil {
+		return fmt.Errorf("delete verify failed: VM %d still exists", vmid)
+	} else if !vmGone(err) {
+		return fmt.Errorf("delete verify failed: %w", err)
+	}
+	fmt.Printf("Deleted VM %d (%s) from node %s (%s)\n", vmid, display, node, addr)
+	vmLedgerRemove(user, addr, vmid)
+	remember(user, addr, node)
 	return nil
 }

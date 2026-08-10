@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"reflect"
 	"testing"
 )
@@ -120,7 +121,7 @@ func TestParseNextID(t *testing.T) {
 // storageJSON is realistic "pvesh get /nodes/pve/storage" output: local
 // has no images content, nfs is inactive, local-lvm is the pick.
 const storageJSON = `[
-  {"storage":"local","type":"dir","content":"iso,vztmpl,backup","enabled":1,"active":1,"total":1000000000000,"used":100000000000,"avail":900000000000},
+  {"storage":"local","type":"dir","path":"/var/lib/vz","content":"iso,vztmpl,backup","enabled":1,"active":1,"total":1000000000000,"used":100000000000,"avail":900000000000},
   {"storage":"local-lvm","type":"lvmthin","content":"images,rootdir","enabled":1,"active":1,"total":536870912000,"used":107374182400,"avail":429496729600},
   {"storage":"nfs","type":"nfs","content":"images","enabled":1,"active":0,"total":1000000000000,"used":0,"avail":1000000000000}
 ]`
@@ -226,7 +227,7 @@ func TestQMCreateArgv(t *testing.T) {
 		"--net0", "virtio,bridge=vmbr0",
 		"--scsihw", "virtio-scsi-pci",
 	}
-	got, err := qmCreateArgv(100, sel, "local-lvm", "debian-12.iso")
+	got, err := qmCreateArgv(100, sel, "local-lvm", "local", "debian-12.iso")
 	if err != nil {
 		t.Fatalf("qmCreateArgv: unexpected error: %v", err)
 	}
@@ -250,7 +251,7 @@ func TestQMCreateArgv(t *testing.T) {
 		"--net0", "virtio,bridge=vmbr0",
 		"--scsihw", "virtio-scsi-pci",
 	}
-	got, err = qmCreateArgv(100, sel, "local-lvm", "a@b.iso")
+	got, err = qmCreateArgv(100, sel, "local-lvm", "local", "a@b.iso")
 	if err != nil {
 		t.Fatalf("qmCreateArgv(a@b.iso): unexpected error: %v", err)
 	}
@@ -261,25 +262,46 @@ func TestQMCreateArgv(t *testing.T) {
 		t.Errorf("built argv must pass the remote gate, got: %v", err)
 	}
 
+	// A non-default ISO storage flows into the cdrom volume.
+	got, err = qmCreateArgv(100, sel, "local-lvm", "nfs-iso", "debian-12.iso")
+	if err != nil {
+		t.Fatalf("qmCreateArgv(nfs-iso): unexpected error: %v", err)
+	}
+	wantIDE2 := "nfs-iso:iso/debian-12.iso,media=cdrom"
+	ide2Idx := -1
+	for i, a := range got {
+		if a == "--ide2" {
+			ide2Idx = i + 1
+		}
+	}
+	if ide2Idx < 0 || got[ide2Idx] != wantIDE2 {
+		t.Errorf("ide2 value = %v, want %q (full argv %v)", got[ide2Idx], wantIDE2, got)
+	}
+	if _, err := allowRemoteCommand(got); err != nil {
+		t.Errorf("built argv must pass the remote gate, got: %v", err)
+	}
+
 	// Invalid inputs are rejected locally, before any network I/O.
 	bad := []struct {
-		label   string
-		vmid    int
-		sel     resourceSelection
-		storage string
-		iso     string
+		label      string
+		vmid       int
+		sel        resourceSelection
+		storage    string
+		isoStorage string
+		iso        string
 	}{
-		{"vmid 99", 99, sel, "local-lvm", "debian-12.iso"},
-		{"cores 0", 100, resourceSelection{cores: 0, memoryMiB: 2048, diskGiB: 20}, "local-lvm", "debian-12.iso"},
-		{"cores 8193", 100, resourceSelection{cores: 8193, memoryMiB: 2048, diskGiB: 20}, "local-lvm", "debian-12.iso"},
-		{"memory 4", 100, resourceSelection{cores: 2, memoryMiB: 4, diskGiB: 20}, "local-lvm", "debian-12.iso"},
-		{"memory 4194305", 100, resourceSelection{cores: 2, memoryMiB: 4194305, diskGiB: 20}, "local-lvm", "debian-12.iso"},
-		{"disk 0", 100, resourceSelection{cores: 2, memoryMiB: 2048, diskGiB: 0}, "local-lvm", "debian-12.iso"},
-		{"storage a:b", 100, sel, "a:b", "debian-12.iso"},
-		{"iso a b.iso", 100, sel, "local-lvm", "a b.iso"},
+		{"vmid 99", 99, sel, "local-lvm", "local", "debian-12.iso"},
+		{"cores 0", 100, resourceSelection{cores: 0, memoryMiB: 2048, diskGiB: 20}, "local-lvm", "local", "debian-12.iso"},
+		{"cores 8193", 100, resourceSelection{cores: 8193, memoryMiB: 2048, diskGiB: 20}, "local-lvm", "local", "debian-12.iso"},
+		{"memory 4", 100, resourceSelection{cores: 2, memoryMiB: 4, diskGiB: 20}, "local-lvm", "local", "debian-12.iso"},
+		{"memory 4194305", 100, resourceSelection{cores: 2, memoryMiB: 4194305, diskGiB: 20}, "local-lvm", "local", "debian-12.iso"},
+		{"disk 0", 100, resourceSelection{cores: 2, memoryMiB: 2048, diskGiB: 0}, "local-lvm", "local", "debian-12.iso"},
+		{"disk storage a:b", 100, sel, "a:b", "local", "debian-12.iso"},
+		{"iso storage a:b", 100, sel, "local-lvm", "a:b", "debian-12.iso"},
+		{"iso a b.iso", 100, sel, "local-lvm", "local", "a b.iso"},
 	}
 	for _, c := range bad {
-		if _, err := qmCreateArgv(c.vmid, c.sel, c.storage, c.iso); err == nil {
+		if _, err := qmCreateArgv(c.vmid, c.sel, c.storage, c.isoStorage, c.iso); err == nil {
 			t.Errorf("%s: expected error", c.label)
 		}
 	}
@@ -303,6 +325,86 @@ func TestValidateSelection(t *testing.T) {
 		}
 		if !c.wantErr && err != nil {
 			t.Errorf("%s: unexpected error: %v", c.label, err)
+		}
+	}
+}
+
+func TestParseIsoStorage(t *testing.T) {
+	cases := []struct {
+		label    string
+		data     string
+		storeDir string
+		wantID   string
+		wantPath string
+		wantUsed int64
+		wantErr  bool
+	}{
+		{"default store matches local", storageJSON, "/var/lib/vz/template/iso", "local", "/var/lib/vz", 100000000000, false},
+		{"custom store matches by path", `[{"storage":"iso-nfs","type":"dir","path":"/mnt/iso","content":"iso","enabled":1,"active":1,"total":500000000000,"used":50000000000}]`,
+			"/mnt/iso/template/iso", "iso-nfs", "/mnt/iso", 50000000000, false},
+		{"no path match falls back to first iso storage", `[{"storage":"local","type":"dir","path":"/var/lib/vz","content":"iso","enabled":1,"active":1,"total":1000000000000,"used":100000000000},
+			{"storage":"local-lvm","type":"lvmthin","content":"images","enabled":1,"active":1,"total":536870912000,"used":107374182400}]`,
+			"/odd/store", "local", "/var/lib/vz", 100000000000, false},
+		{"inactive iso storage skipped", `[{"storage":"nfs","type":"nfs","content":"iso","enabled":1,"active":0,"total":1000000000000,"used":0}]`,
+			"/var/lib/vz/template/iso", "", "", 0, true},
+		{"no iso content", `[{"storage":"local-lvm","type":"lvmthin","content":"images","enabled":1,"active":1,"total":536870912000,"used":0}]`,
+			"/var/lib/vz/template/iso", "", "", 0, true},
+		{"bad json", `{`, "/var/lib/vz/template/iso", "", "", 0, true},
+	}
+	for _, c := range cases {
+		id, path, total, used, err := parseIsoStorage([]byte(c.data), c.storeDir)
+		if c.wantErr {
+			if err == nil {
+				t.Errorf("%s: expected error, got %s/%s", c.label, id, path)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("%s: unexpected error: %v", c.label, err)
+			continue
+		}
+		if id != c.wantID || path != c.wantPath || used != c.wantUsed || total <= used {
+			t.Errorf("%s: got (%s, %s, %d, %d), want (%s, %s, used %d)", c.label, id, path, total, used, c.wantID, c.wantPath, c.wantUsed)
+		}
+	}
+}
+
+func TestParseVMList(t *testing.T) {
+	vms, err := parseVMList([]byte(resourcesJSON))
+	if err != nil {
+		t.Fatalf("parseVMList: %v", err)
+	}
+	if len(vms) != 3 { // qemu 100, 101, 102 — lxc/103 excluded
+		t.Fatalf("parseVMList = %d entries, want 3", len(vms))
+	}
+	byID := map[int]clusterResource{}
+	for _, v := range vms {
+		byID[v.VMID] = v
+	}
+	if byID[100].Name != "vm1" || byID[100].Node != "pve" {
+		t.Errorf("VM 100 = %+v, want name vm1 on pve", byID[100])
+	}
+	if byID[102].Name != "other" || byID[102].Node != "pve2" {
+		t.Errorf("VM 102 = %+v, want name other on pve2", byID[102])
+	}
+	if _, err := parseVMList([]byte(`{`)); err == nil {
+		t.Error("parseVMList on bad json: expected error")
+	}
+}
+
+func TestVMGone(t *testing.T) {
+	cases := []struct {
+		msg  string
+		want bool
+	}{
+		{`remote command "qm status 100" failed: VM 100 not found (Process exited with status 1)`, true},
+		{`remote command "qm status 100" failed: Configuration file 'nodes/pve/qemu-server/100.conf' does not exist (Process exited with status 1)`, true},
+		{`remote command "qm status 100" failed: connection reset`, false},
+		{"", false},
+	}
+	for _, c := range cases {
+		if got := vmGone(errors.New(c.msg)); got != c.want {
+			t.Errorf("vmGone(%q) = %v, want %v", c.msg, got, c.want)
 		}
 	}
 }

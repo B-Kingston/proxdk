@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -161,11 +162,13 @@ func passwordAuth(user, addr string, cb ssh.HostKeyCallback) (*goph.Client, erro
 }
 
 // connect establishes one SSH connection with the full auth flow:
-// agent+default keys → keygen offer (when no keys exist) → hidden password
-// prompt → optional in-process key copy → reconnect by key. Refusing to
-// trust an unknown host aborts here: the password flow never runs against
-// a host the user just declined to verify.
-func connect(user, addr string) (*goph.Client, error) {
+// profile key + agent + default keys → keygen offer (when no keys exist) →
+// hidden password prompt → optional in-process key copy → reconnect by
+// key. extraKeys are tried before the default keys (the host profile's
+// configured key). Refusing to trust an unknown host aborts here: the
+// password flow never runs against a host the user just declined to
+// verify.
+func connect(user, addr string, extraKeys []string) (*goph.Client, error) {
 	state := &trustState{decided: make(map[string]bool)}
 	cb, err := hostKeyCallback(state)
 	if err != nil {
@@ -175,7 +178,12 @@ func connect(user, addr string) (*goph.Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("cannot determine home directory: %w", err)
 	}
-	keys := findDefaultKeys(filepath.Join(home, ".ssh"))
+	keys := extraKeys
+	for _, k := range findDefaultKeys(filepath.Join(home, ".ssh")) {
+		if !slices.Contains(keys, k) {
+			keys = append(keys, k)
+		}
+	}
 
 	if len(keys) == 0 && !goph.HasAgent() {
 		gen, err := askConfirm("No SSH key found (~/.ssh). Generate one now? (ssh-keygen -t ed25519)", true)

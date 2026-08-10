@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/melbahja/goph/v2"
@@ -11,15 +13,18 @@ import (
 )
 
 var (
-	flagNode     string
-	flagISO      string
-	flagDelete   bool
-	flagForce    bool
-	flagCreateVM bool
-	flagCores    int
-	flagMemory   int
-	flagDisk     int
-	flagVmid     int
+	flagNode        string
+	flagISO         string
+	flagDelete      bool
+	flagForce       bool
+	flagCreateVM    bool
+	flagCores       int
+	flagMemory      int
+	flagDisk        int
+	flagVmid        int
+	flagList        bool
+	flagVM          int
+	flagDefaultHost bool
 )
 
 var rootCmd = &cobra.Command{
@@ -27,8 +32,10 @@ var rootCmd = &cobra.Command{
 	Version: "v0.1.0",
 	Short:   "Manage ISOs in a Proxmox node's local ISO store over SSH",
 	Long: `Interactive when run with no args. gh-style.
-  Upload:  proxdk root@192.168.1.10 --node pve --iso ./debian-12.iso [my-name]
-  Delete:  proxdk root@192.168.1.10 --node pve --iso debian-12.iso -D`,
+  Upload:    proxdk root@192.168.1.10 --node pve --iso ./debian-12.iso [my-name]
+  Delete:    proxdk root@192.168.1.10 --node pve --iso debian-12.iso -D
+  List:      proxdk root@192.168.1.10 --list
+  Delete VM: proxdk root@192.168.1.10 -D --vm 100`,
 	Args:         cobra.MaximumNArgs(2),
 	SilenceUsage: true,
 	RunE:         run,
@@ -51,6 +58,9 @@ func init() {
 	rootCmd.Flags().IntVar(&flagMemory, "memory", 0, "memory for the new VM in MiB (with --create-vm)")
 	rootCmd.Flags().IntVar(&flagDisk, "disk", 0, "disk size for the new VM in GiB (with --create-vm)")
 	rootCmd.Flags().IntVar(&flagVmid, "vmid", 0, "VM ID for the new VM (default: next free)")
+	rootCmd.Flags().BoolVar(&flagList, "list", false, "list the ISOs in the node's store")
+	rootCmd.Flags().IntVar(&flagVM, "vm", 0, "VM ID to delete (with -D)")
+	rootCmd.Flags().BoolVar(&flagDefaultHost, "default-host", false, "remember the connected host as the default for bare invocations")
 }
 
 func run(cmd *cobra.Command, args []string) error {
@@ -70,6 +80,23 @@ func run(cmd *cobra.Command, args []string) error {
 	}
 	if !flagCreateVM && (flagCores != 0 || flagMemory != 0 || flagDisk != 0 || flagVmid != 0) {
 		return fmt.Errorf("--cores/--memory/--disk/--vmid only apply with --create-vm")
+	}
+	if flagList && (flagDelete || flagCreateVM || flagForce || flagISO != "" || flagVM != 0) {
+		return fmt.Errorf("--list cannot be combined with upload/delete/create flags")
+	}
+	if flagList && len(args) > 1 {
+		return fmt.Errorf("iso_name argument is not used with --list")
+	}
+	if flagVM != 0 && !flagDelete {
+		return fmt.Errorf("--vm only applies with --delete")
+	}
+	if flagVM != 0 && flagISO != "" {
+		return fmt.Errorf("--iso and --vm are mutually exclusive")
+	}
+	if flagVM != 0 {
+		if err := validVMID(flagVM); err != nil {
+			return fmt.Errorf("invalid --vm: %w", err)
+		}
 	}
 	if flagCreateVM {
 		set := 0
@@ -99,28 +126,25 @@ func run(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	var err error
+	if gCfg, err = loadConfig(); err != nil {
+		return err
+	}
+
+	// action is only set by the fully interactive picker; flag-driven
+	// runs dispatch on the flags instead.
+	action := -1
 	deleteMode := flagDelete
-	if len(args) == 0 && !flagDelete && !flagForce && flagISO == "" && flagNode == "" {
-		// Fully interactive: pick the action first. "Create a VM from an
-		// existing ISO" is its own flow; --create-vm is irrelevant here
-		// (it only changes the upload flow, and this branch ignores
-		// upload flags).
-		idx, err := askChoice("What do you want to do?", []string{"Upload an ISO", "Delete an ISO", "Create a VM from an existing ISO"}, 0)
+	if len(args) == 0 && !flagDelete && !flagForce && !flagList && flagVM == 0 && !flagDefaultHost && flagISO == "" && flagNode == "" {
+		// Fully interactive: pick the action first. The picker-only
+		// actions are their own flows; --create-vm/--cores etc. are
+		// irrelevant here (this branch ignores upload flags).
+		idx, err := askChoice("What do you want to do?", []string{"Upload an ISO", "Delete an ISO", "Create a VM from an existing ISO", "Delete a VM", "List ISOs"}, 0)
 		if err != nil {
 			return err
 		}
-		deleteMode = idx == 1
-		if idx == 2 {
-			host, err := askText("Proxmox host (user@addr): ")
-			if err != nil {
-				return err
-			}
-			user, addr, err := parseHost(host)
-			if err != nil {
-				return err
-			}
-			return runCreate(user, addr)
-		}
+		action = idx
+		deleteMode = idx == actionDeleteISO
 	}
 
 	if !deleteMode && flagISO != "" {
@@ -135,24 +159,125 @@ func run(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	user, addr, err := resolveHost(args)
+	if err != nil {
+		return err
+	}
+
+	switch action {
+	case actionCreateVM:
+		return runCreate(user, addr)
+	case actionList:
+		return runList(user, addr)
+	case actionDeleteVM:
+		vmid, err := promptVMID(flagVM)
+		if err != nil {
+			return err
+		}
+		return runDeleteVM(user, addr, vmid)
+	}
+	if flagList {
+		return runList(user, addr)
+	}
+	if flagVM != 0 {
+		return runDeleteVM(user, addr, flagVM)
+	}
+	var runErr error
+	if deleteMode {
+		runErr = runDelete(user, addr)
+	} else {
+		runErr = runUpload(user, addr, args)
+	}
+	if runErr != nil {
+		return runErr
+	}
+	if flagDefaultHost {
+		gCfg.DefaultHost = hostKey(user, addr)
+		if err := saveConfig(gCfg); err != nil {
+			return fmt.Errorf("cannot save default host: %w", err)
+		}
+		fmt.Printf("Default host set to %s\n", hostKey(user, addr))
+	}
+	return nil
+}
+
+// action constants for the interactive action picker.
+const (
+	actionUpload = iota
+	actionDeleteISO
+	actionCreateVM
+	actionDeleteVM
+	actionList
+)
+
+// resolveHost returns the target host: the positional argument when given,
+// else the configured default host, else a single configured profile, else
+// an interactive choice.
+func resolveHost(args []string) (user, addr string, err error) {
 	host := ""
 	if len(args) > 0 {
 		host = args[0]
 	} else {
-		var err error
-		host, err = askText("Proxmox host (user@addr): ")
+		host = defaultHostFromConfig()
+	}
+	if host == "" {
+		host, err = promptHost()
 		if err != nil {
-			return err
+			return "", "", err
 		}
 	}
-	user, addr, err := parseHost(host)
+	user, addr, err = parseHost(host)
+	return user, addr, err
+}
+
+// defaultHostFromConfig returns the configured default host, or the only
+// configured profile, or "".
+func defaultHostFromConfig() string {
+	if gCfg.DefaultHost != "" {
+		return gCfg.DefaultHost
+	}
+	if len(gCfg.Hosts) == 1 {
+		for hk := range gCfg.Hosts {
+			return hk
+		}
+	}
+	return ""
+}
+
+// promptHost asks for a host, offering the configured profiles first.
+func promptHost() (string, error) {
+	if len(gCfg.Hosts) > 0 {
+		keys := make([]string, 0, len(gCfg.Hosts)+1)
+		for hk := range gCfg.Hosts {
+			keys = append(keys, hk)
+		}
+		sort.Strings(keys)
+		keys = append(keys, "Enter a host manually")
+		idx, err := askChoice("Select host", keys, 0)
+		if err != nil {
+			return "", err
+		}
+		if idx < len(keys)-1 {
+			return keys[idx], nil
+		}
+	}
+	return askText("Proxmox host (user@addr): ")
+}
+
+// promptVMID asks for a VM ID when the --vm flag did not supply one.
+func promptVMID(vmid int) (int, error) {
+	if vmid != 0 {
+		return vmid, nil
+	}
+	answer, err := askText("VM ID to delete: ")
 	if err != nil {
-		return err
+		return 0, err
 	}
-	if deleteMode {
-		return runDelete(user, addr)
+	n, err := strconv.Atoi(answer)
+	if err != nil || validVMID(n) != nil {
+		return 0, fmt.Errorf("invalid VM ID %q (use 100-999999999)", answer)
 	}
-	return runUpload(user, addr, args)
+	return n, nil
 }
 
 // resolveNode returns the target node: the validated --node flag when given
@@ -190,6 +315,9 @@ func resolveNode(c *goph.Client, addr string) (string, error) {
 }
 
 func runUpload(user, addr string, args []string) error {
+	if err := applyProfile(user, addr); err != nil {
+		return err
+	}
 	isoPath := flagISO
 	if isoPath == "" {
 		var err error
@@ -227,7 +355,7 @@ func runUpload(user, addr string, args []string) error {
 		return fmt.Errorf("invalid ISO name: %w", err)
 	}
 
-	c, err := connect(user, addr)
+	c, err := connect(user, addr, []string{profileFor(user, addr).Key})
 	if err != nil {
 		return err
 	}
@@ -243,7 +371,7 @@ func runUpload(user, addr string, args []string) error {
 		return err
 	}
 	if !ok {
-		return fmt.Errorf("%s not found on %s — is this a Proxmox host? (custom local storage paths are not supported in v0.1)", isoStoreDir, addr)
+		return fmt.Errorf("%s not found on %s — is this a Proxmox host? (the configured store may be wrong; check the storage setting of the host profile)", isoStoreDir, addr)
 	}
 
 	fs, err := newRemoteFS(c)
@@ -266,7 +394,11 @@ func runUpload(user, addr string, args []string) error {
 			}
 			if !overwrite {
 				fmt.Printf("Already present on %s — skipping.\n", node)
-				return runProvision(c, node, name)
+				remember(user, addr, node)
+				if !flagCreateVM {
+					return nil
+				}
+				return provisionAndTrack(user, addr, c, node, name)
 			}
 		}
 	}
@@ -287,13 +419,34 @@ func runUpload(user, addr string, args []string) error {
 		return fmt.Errorf("size mismatch after upload (%d != %d) — rerun to retry", got, fi.Size())
 	}
 	fmt.Printf("OK: %s (%d bytes) on node %s (%s)\n", name, fi.Size(), node, addr)
-	return runProvision(c, node, name)
+	ledgerAdd(user, addr, name)
+	remember(user, addr, node)
+	if !flagCreateVM {
+		return nil
+	}
+	return provisionAndTrack(user, addr, c, node, name)
+}
+
+// provisionAndTrack runs the provision flow and records the created VM in
+// the host's VM ledger. Declined or failed provisions record nothing.
+func provisionAndTrack(user, addr string, c *goph.Client, node, name string) error {
+	vmid, err := runProvision(c, node, name)
+	if err != nil {
+		return err
+	}
+	if vmid != 0 {
+		vmLedgerAdd(user, addr, vmid)
+	}
+	return nil
 }
 
 // runCreate is the interactive "Create a VM from an existing ISO" flow:
 // pick an ISO already in the store, then provision a VM from it.
 func runCreate(user, addr string) error {
-	c, err := connect(user, addr)
+	if err := applyProfile(user, addr); err != nil {
+		return err
+	}
+	c, err := connect(user, addr, []string{profileFor(user, addr).Key})
 	if err != nil {
 		return err
 	}
@@ -308,23 +461,56 @@ func runCreate(user, addr string) error {
 	if err != nil {
 		return err
 	}
-	if len(files) == 0 {
+	isos := make([]string, 0, len(files))
+	for _, f := range files {
+		if !strings.HasSuffix(f, ".tmp") { // upload leftovers are not ISOs
+			isos = append(isos, f)
+		}
+	}
+	if len(isos) == 0 {
 		return fmt.Errorf("no ISOs in the store on node %s", node)
 	}
-	idx, err := askChoice("Select ISO", files, 0)
+	idx, err := askChoice("Select ISO", isos, 0)
 	if err != nil {
 		return err
 	}
-	return runProvision(c, node, files[idx])
+	if err := provisionAndTrack(user, addr, c, node, isos[idx]); err != nil {
+		return err
+	}
+	remember(user, addr, node)
+	return nil
 }
 
 func runDelete(user, addr string) error {
+	if err := applyProfile(user, addr); err != nil {
+		return err
+	}
 	name := flagISO
 	if name == "" {
-		var err error
-		name, err = askText("ISO name to delete: ")
-		if err != nil {
-			return err
+		// Prefer the tracked uploads: those are the only ISOs proxdk may
+		// delete. A manual entry is offered so a stale .tmp leftover can
+		// still be named.
+		tracked := trackedUploads(user, addr)
+		if len(tracked) > 0 {
+			tracked = append(tracked, "Enter a name manually")
+			idx, err := askChoice("Select ISO to delete", tracked, 0)
+			if err != nil {
+				return err
+			}
+			if idx == len(tracked)-1 {
+				name, err = askText("ISO name to delete: ")
+				if err != nil {
+					return err
+				}
+			} else {
+				name = tracked[idx]
+			}
+		} else {
+			var err error
+			name, err = askText("ISO name to delete: ")
+			if err != nil {
+				return err
+			}
 		}
 	}
 	name, err := targetName(name)
@@ -332,7 +518,14 @@ func runDelete(user, addr string) error {
 		return fmt.Errorf("invalid ISO name: %w", err)
 	}
 
-	c, err := connect(user, addr)
+	// Deletion is confined to ISOs proxdk uploaded (the ledger) and its
+	// own .tmp leftovers. Anything else predates proxdk or came from
+	// elsewhere — refuse before connecting.
+	if !isDeletableISO(user, addr, name) {
+		return fmt.Errorf("refusing to delete %q: it is not tracked as an ISO proxdk uploaded to %s. Delete it through the Proxmox UI, or edit the uploads list in the config file", name, hostKey(user, addr))
+	}
+
+	c, err := connect(user, addr, []string{profileFor(user, addr).Key})
 	if err != nil {
 		return err
 	}
@@ -380,5 +573,7 @@ func runDelete(user, addr string) error {
 		return fmt.Errorf("delete verify failed: %s still present", name)
 	}
 	fmt.Printf("Deleted %s from node %s (%s)\n", name, node, addr)
+	ledgerRemove(user, addr, name)
+	remember(user, addr, node)
 	return nil
 }

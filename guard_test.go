@@ -6,7 +6,7 @@ import (
 )
 
 func TestAllowRemoteCommand(t *testing.T) {
-	store := "/var/lib/vz/template/iso"
+	store := isoStoreDir
 
 	type tc struct {
 		argv   []string
@@ -45,9 +45,11 @@ func TestAllowRemoteCommand(t *testing.T) {
 		{[]string{"pvesh", "get", "/cluster/resources", "--output-format", "json"}, "pvesh get /cluster/resources --output-format json", false},
 		{[]string{"pvesh", "get", "/nodes/pve/storage", "--output-format", "json"}, "pvesh get /nodes/pve/storage --output-format json", false},
 
-		// qm status/start with a valid VMID.
+		// qm status/start/destroy with a valid VMID.
 		{[]string{"qm", "status", "100"}, "qm status 100", false},
 		{[]string{"qm", "start", "999999999"}, "qm start 999999999", false},
+		{[]string{"qm", "destroy", "100"}, "qm destroy 100", false},
+		{[]string{"qm", "destroy", "999999999"}, "qm destroy 999999999", false},
 
 		// qm create: the exact shape qmCreateArgv emits (with and without
 		// the --name pair).
@@ -74,6 +76,18 @@ func TestAllowRemoteCommand(t *testing.T) {
 			"--net0", "virtio,bridge=vmbr0",
 			"--scsihw", "virtio-scsi-pci",
 		}, "qm create 100 --sockets 1 --cores 4 --memory 8192 --scsi0 local-lvm:32 --ide2 local:iso/debian-12.iso,media=cdrom --boot order=ide2 --net0 virtio,bridge=vmbr0 --scsihw virtio-scsi-pci", false},
+		{[]string{
+			"qm", "create", "100",
+			"--name", "debian-12",
+			"--sockets", "1",
+			"--cores", "4",
+			"--memory", "8192",
+			"--scsi0", "local-lvm:32",
+			"--ide2", "nfs-iso:iso/debian-12.iso,media=cdrom",
+			"--boot", "order=ide2",
+			"--net0", "virtio,bridge=vmbr0",
+			"--scsihw", "virtio-scsi-pci",
+		}, "qm create 100 --name debian-12 --sockets 1 --cores 4 --memory 8192 --scsi0 local-lvm:32 --ide2 nfs-iso:iso/debian-12.iso,media=cdrom --boot order=ide2 --net0 virtio,bridge=vmbr0 --scsihw virtio-scsi-pci", false},
 
 		// pvesh lookalikes.
 		{[]string{"pvesh", "get", "/nodes/pve/status"}, "", true},  // not allowlisted
@@ -102,7 +116,11 @@ func TestAllowRemoteCommand(t *testing.T) {
 		{[]string{"qm", "status", "1e3"}, "", true},
 		{[]string{"qm", "status", "100", "extra"}, "", true},
 		{[]string{"qm", "start", "99"}, "", true},
-		{[]string{"qm", "destroy", "100"}, "", true},
+		{[]string{"qm", "destroy", "99"}, "", true},
+		{[]string{"qm", "destroy", "+100"}, "", true},
+		{[]string{"qm", "destroy", "100", "--purge"}, "", true},
+		{[]string{"qm", "destroy", "100", "extra"}, "", true},
+		{[]string{"qm", "destro", "100"}, "", true},
 
 		// qm create: structural deviations (lookalikes of the exact shape).
 		{[]string{"qm", "create", "100"}, "", true}, // no options at all
@@ -142,6 +160,14 @@ func TestAllowRemoteCommand(t *testing.T) {
 			"--sockets", "1", "--cores", "4", "--memory", "8192", "--scsi0", "local-lvm:32",
 			"--ide2", "local:iso/../x.iso,media=cdrom", "--boot", "order=ide2",
 			"--net0", "virtio,bridge=vmbr0", "--scsihw", "virtio-scsi-pci"}, "", true}, // traversal in ISO name
+		{[]string{"qm", "create", "100",
+			"--sockets", "1", "--cores", "4", "--memory", "8192", "--scsi0", "local-lvm:32",
+			"--ide2", "/etc:iso/x.iso,media=cdrom", "--boot", "order=ide2",
+			"--net0", "virtio,bridge=vmbr0", "--scsihw", "virtio-scsi-pci"}, "", true}, // storage escapes
+		{[]string{"qm", "create", "100",
+			"--sockets", "1", "--cores", "4", "--memory", "8192", "--scsi0", "local-lvm:32",
+			"--ide2", "local x:iso/x.iso,media=cdrom", "--boot", "order=ide2",
+			"--net0", "virtio,bridge=vmbr0", "--scsihw", "virtio-scsi-pci"}, "", true}, // space in storage id
 		{[]string{"qm", "create", "100",
 			"--sockets", "1", "--cores", "4", "--memory", "8192", "--scsi0", "local-lvm:32",
 			"--ide2", "local:iso/x iso,media=cdrom", "--boot", "order=ide2",
@@ -242,7 +268,7 @@ func TestAllowRemoteCommand(t *testing.T) {
 }
 
 func TestIsStorePath(t *testing.T) {
-	store := "/var/lib/vz/template/iso"
+	store := isoStoreDir
 	cases := []struct {
 		path string
 		want bool
@@ -266,7 +292,7 @@ func TestIsStorePath(t *testing.T) {
 }
 
 func TestStorePath(t *testing.T) {
-	store := "/var/lib/vz/template/iso"
+	store := isoStoreDir
 	cases := []struct {
 		name    string
 		want    string
